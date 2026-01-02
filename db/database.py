@@ -2,19 +2,19 @@ import os
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker, declarative_base
 
-# ----------------------------------------
-# Database URL resolution
-# ----------------------------------------
+# --------------------------------------------------
+# Database URL resolution (SAFE FOR RENDER + LOCAL)
+# --------------------------------------------------
 
 DATABASE_URL = os.getenv("DATABASE_URL")
 
-# Fallback for local / free-tier deployments
+# Fallback to SQLite for local / free-tier deployment
 if not DATABASE_URL:
     DATABASE_URL = "sqlite:///./app.db"
 
-# ----------------------------------------
+# --------------------------------------------------
 # SQLAlchemy setup
-# ----------------------------------------
+# --------------------------------------------------
 
 engine = create_engine(
     DATABASE_URL,
