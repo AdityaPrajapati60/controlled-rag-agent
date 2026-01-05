@@ -1,0 +1,9 @@
+[33m38891a6[m Initial commit: controlled RAG + agent execution system
+[33m8238ab0[m[33m ([m[1;33mtag: [m[1;33mv1.0-core[m[33m)[m Add initial README
+[33mcaa20e4[m Add SQLite fallback when DATABASE_URL is missing
+[33m8b7c945[m Fix DB fallback and pin Python to 3.11 for Render
+[33mfd5e592[m Add dockerignore to reduce Railway image size
+[33mb8a616e[m Add minimal Dockerfile for Railway deployment
+[33m102cebe[m Remove deployment-specific files; keep project local
+[33md62b34e[m Final stable agent architecture (RAG + planner + engine)
+[33mb1cfd19[m[33m ([m[1;36mHEAD[m[33m -> [m[1;32mmain[m[33m, [m[1;31morigin/main[m[33m)[m Finalize agent system and document lifecycle

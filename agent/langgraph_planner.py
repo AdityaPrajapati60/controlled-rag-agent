@@ -1,3 +1,5 @@
+# agent/langgraph_planner.py
+
 from typing import TypedDict, List
 from langgraph.graph import StateGraph, END
 from groq import Groq
@@ -38,73 +40,117 @@ Allowed tools:
 
 
 # -----------------------------
-# Plan Normalization (CRITICAL)
+# Plan Normalization (AUTHORITATIVE)
 # -----------------------------
 def normalize_plan(plan: list, user_input: str) -> list:
     text = user_input.lower()
 
     DOC_KEYWORDS = [
         "document",
-        "this document",
-        "the document",
-        "uploaded file",
-        "uploaded document",
         "resume",
         "pdf",
+        "uploaded",
+        "file",
+        "this document",
+        "my document",
     ]
 
     tools = [step.get("tool") for step in plan]
 
-    # 🔒 Deterministic RAG trigger
+    # ------------------------------------------------
+    # FORCE RAG FOR DOCUMENT QUESTIONS
+    # ------------------------------------------------
     if any(k in text for k in DOC_KEYWORDS):
         if "retrieve_context" not in tools:
             plan.insert(0, {"tool": "retrieve_context", "args": {}})
             tools.insert(0, "retrieve_context")
 
-    # 🔒 If RAG used, ALWAYS follow with generate_answer
-    if "retrieve_context" in tools and "generate_answer" not in tools:
-        plan.append({"tool": "generate_answer", "args": {}})
+    normalized = []
 
-    # 🔒 Enforce contract: generate_answer never has args
     for step in plan:
-        if step.get("tool") == "generate_answer":
-            step["args"] = {}
+        tool = step.get("tool")
+        raw_args = step.get("args", {}) or {}
 
-    return plan
+        # -----------------------------
+        # generate_answer / retrieve_context / get_tasks
+        # -----------------------------
+        if tool in {"generate_answer", "retrieve_context", "get_tasks"}:
+            normalized.append({"tool": tool, "args": {}})
+            continue
+
+        # -----------------------------
+        # create_task (TITLE REQUIRED)
+        # -----------------------------
+        if tool == "create_task":
+            title = (
+                raw_args.get("title")
+                or raw_args.get("task_name")
+                or raw_args.get("task")
+                or user_input.strip()        # 🔒 fallback
+            )
+
+            description = (
+                raw_args.get("description")
+                or raw_args.get("task_description")
+            )
+
+            normalized.append(
+                {
+                    "tool": "create_task",
+                    "args": {
+                        "title": title,
+                        "description": description,
+                    },
+                }
+            )
+            continue
+
+        # -----------------------------
+        # unknown tool (pass-through)
+        # -----------------------------
+        normalized.append({"tool": tool, "args": raw_args})
+
+    # ------------------------------------------------
+    # ENSURE generate_answer IS LAST
+    # ------------------------------------------------
+    if not any(step["tool"] == "generate_answer" for step in normalized):
+        normalized.append({"tool": "generate_answer", "args": {}})
+
+    return normalized
 
 
 # -----------------------------
 # LLM Planner Node
 # -----------------------------
 def plan_with_llm(state: PlannerState) -> PlannerState:
-    response = client.chat.completions.create(
-        model="llama-3.1-8b-instant",
-        temperature=0,
-        messages=[
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": state["user_input"]},
-        ],
-    )
-
-    raw = response.choices[0].message.content.strip()
+    raw_plan = []
 
     try:
-        # 1️⃣ Parse JSON
-        plan = json.loads(raw)
-        if not isinstance(plan, list):
-            raise ValueError("Planner output must be a list")
+        response = client.chat.completions.create(
+            model="llama-3.1-8b-instant",
+            temperature=0,
+            messages=[
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": state["user_input"]},
+            ],
+        )
 
-        # 2️⃣ Normalize semantics (DETERMINISTIC RAG TRIGGER)
-        plan = normalize_plan(plan, state["user_input"])
+        raw = response.choices[0].message.content.strip()
+        raw_plan = json.loads(raw)
 
+        if not isinstance(raw_plan, list):
+            raw_plan = []
 
     except Exception:
-        # 3️⃣ Safe deterministic fallback
-        plan = [{"tool": "generate_answer", "args": {}}]
+        # ❌ DO NOT return here
+        raw_plan = []
+
+    # ✅ ALWAYS normalize — even if LLM failed
+    final_plan = normalize_plan(raw_plan, state["user_input"])
 
     return {
         "user_input": state["user_input"],
-        "plan": plan,
+        "plan": final_plan,
     }
 
 

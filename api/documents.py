@@ -1,17 +1,19 @@
-from fastapi import APIRouter, UploadFile, Depends
+from fastapi import APIRouter, UploadFile, Depends, HTTPException
 from sqlalchemy.orm import Session
 import uuid
 
 from api.auth_helpers import get_current_user
 from db.database import SessionLocal
-from rag.vector_store import get_vector_store
-from rag.chunking import extract_and_chunk_pdf  # your existing logic
+from rag.vector_store import get_vector_store, delete_document
+from rag.chunking import extract_and_chunk_pdf
 from models.document import Document
-from fastapi import HTTPException
 
 router = APIRouter(prefix="/documents", tags=["Documents"])
 
 
+# ------------------------------------------------
+# DB Dependency
+# ------------------------------------------------
 def get_db():
     db = SessionLocal()
     try:
@@ -20,6 +22,9 @@ def get_db():
         db.close()
 
 
+# ------------------------------------------------
+# UPLOAD DOCUMENT
+# ------------------------------------------------
 @router.post("/upload")
 def upload_document(
     file: UploadFile,
@@ -28,8 +33,15 @@ def upload_document(
 ):
     doc_id = str(uuid.uuid4())
 
-    # 🔹 Chunk + embed
+    # 1️⃣ Chunk + embed
     docs = extract_and_chunk_pdf(file)
+
+    if not docs:
+        raise HTTPException(
+            status_code=400,
+            detail="Uploaded PDF contains no extractable text",
+        )
+
     for d in docs:
         d.metadata = {
             "doc_id": doc_id,
@@ -38,8 +50,9 @@ def upload_document(
 
     vector_store = get_vector_store(current_user.id)
     vector_store.add_documents(docs)
+    
 
-    # 🔹 Save document record (SOURCE OF TRUTH)
+    # 2️⃣ Save document metadata (SOURCE OF TRUTH)
     db_doc = Document(
         id=doc_id,
         filename=file.filename,
@@ -55,14 +68,14 @@ def upload_document(
     }
 
 
-
+# ------------------------------------------------
+# LIST DOCUMENTS
+# ------------------------------------------------
 @router.get("/list")
 def list_documents(
     db: Session = Depends(get_db),
     current_user=Depends(get_current_user),
 ):
-    from models.document import Document
-
     documents = (
         db.query(Document)
         .filter(Document.user_id == current_user.id)
@@ -80,20 +93,21 @@ def list_documents(
     ]
 
 
-
-
+# ------------------------------------------------
+# DELETE SINGLE DOCUMENT
+# ------------------------------------------------
 @router.delete("/delete/{doc_id}")
 def delete_single_document(
     doc_id: str,
     db: Session = Depends(get_db),
     current_user=Depends(get_current_user),
 ):
-    # 1️⃣ Check source of truth (SQL)
+    # 1️⃣ Check SQL source of truth
     document = (
         db.query(Document)
         .filter(
             Document.id == doc_id,
-            Document.user_id == current_user.id
+            Document.user_id == current_user.id,
         )
         .first()
     )
@@ -101,17 +115,16 @@ def delete_single_document(
     if not document:
         raise HTTPException(
             status_code=404,
-            detail="Document not found"
+            detail="Document not found",
         )
 
     # 2️⃣ Delete from vector DB
-    from rag.vector_store import delete_document
     delete_document(
         user_id=current_user.id,
-        doc_id=doc_id
+        doc_id=doc_id,
     )
 
-    # 3️⃣ Delete SQL record
+    # 3️⃣ Delete SQL metadata
     db.delete(document)
     db.commit()
 
@@ -120,17 +133,25 @@ def delete_single_document(
     }
 
 
-
+# ------------------------------------------------
+# DELETE ALL DOCUMENTS (FIXED PATH)
+# ------------------------------------------------
 @router.delete("/delete-all")
 def delete_all_documents(
+    db: Session = Depends(get_db),
     current_user=Depends(get_current_user),
 ):
-    from rag.vector_store import delete_all_user_documents
+    # 1️⃣ Delete all vectors
+    vector_store = get_vector_store(current_user.id)
+    vector_store.delete_collection()
 
-    delete_all_user_documents(
-        user_id=current_user.id
-    )
+    # 2️⃣ Delete all metadata
+    db.query(Document).filter(
+        Document.user_id == current_user.id
+    ).delete()
+
+    db.commit()
 
     return {
-        "message": "All user documents deleted from vector DB"
+        "message": "All user documents deleted (vectors + metadata)"
     }

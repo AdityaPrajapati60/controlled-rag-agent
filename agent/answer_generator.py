@@ -26,7 +26,8 @@ Be concise, factual, and clear.
 
     messages = [{"role": "system", "content": system_prompt}]
 
-    if context:
+    # 🔒 CRITICAL FIX: distinguish None vs ""
+    if context is not None:
         messages.append(
             {
                 "role": "system",

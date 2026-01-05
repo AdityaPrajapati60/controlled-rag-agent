@@ -1,3 +1,5 @@
+# agent/engine.py
+
 from models.agent_run import AgentRun
 from models.agent_action import AgentAction
 from models.planner_plan import PlannerPlan
@@ -28,26 +30,20 @@ def estimate_tokens(text: str) -> int:
 
 
 # ------------------------------------------------
-# RAG GATE — ENGINE AUTHORITY
+# RAG GATE — ENGINE IS THE ONLY AUTHORITY
 # ------------------------------------------------
-def is_rag_allowed(prompt: str, intent: str) -> bool:
-    if intent != "ASK_DOC":
-        return False
-
+def is_rag_allowed(prompt: str) -> bool:
     prompt = prompt.lower()
-
     RAG_KEYWORDS = {
         "document",
-        "file",
-        "pdf",
         "resume",
+        "pdf",
         "uploaded",
         "upload",
+        "file",
         "my document",
-        "my file",
         "this document",
     }
-
     return any(k in prompt for k in RAG_KEYWORDS)
 
 
@@ -63,7 +59,7 @@ def run_agent(prompt: str, user, db):
         return {"error": "Agent disabled by ops"}
 
     # ------------------------------------------------
-    # 0.5 HARD INPUT LIMITS (BEFORE ANY LLM / PLANNING)
+    # 0.5 HARD INPUT LIMIT
     # ------------------------------------------------
     if len(prompt) > MAX_PROMPT_CHARS:
         return {
@@ -91,22 +87,12 @@ def run_agent(prompt: str, user, db):
     db.add(run)
     db.flush()
 
-    # ------------------------------------------------
-    # TOKEN BUDGET — INPUT COST
-    # ------------------------------------------------
     run.estimated_tokens_used += estimate_tokens(prompt)
 
-    if run.estimated_tokens_used > MAX_TOKENS_PER_RUN:
-        run.output = "Aborted: token budget exceeded before planning"
-        run.budget_exceeded = True
-        db.commit()
-        return {"error": "Token budget exceeded"}
-
     # ------------------------------------------------
-    # 3. INTENT CLASSIFICATION
+    # 3. INTENT CLASSIFIER (LOGGING ONLY)
     # ------------------------------------------------
     intent_data = classify_intent(prompt) or {"intent": "ANSWER"}
-    intent = intent_data.get("intent", "ANSWER")
 
     db.add(
         AgentAction(
@@ -119,17 +105,6 @@ def run_agent(prompt: str, user, db):
     )
 
     # ------------------------------------------------
-    # 3.5 HARD AUTHORIZATION GATE
-    # ------------------------------------------------
-    if intent == "CREATE_TASK":
-        try:
-            is_tool_allowed(user, "create_task")
-        except Exception:
-            run.output = "Forbidden: You are not allowed to create tasks."
-            db.commit()
-            return {"error": run.output, "status": 403}
-
-    # ------------------------------------------------
     # 4. PLANNING (LANGGRAPH)
     # ------------------------------------------------
     try:
@@ -140,13 +115,8 @@ def run_agent(prompt: str, user, db):
         db.commit()
         return {"error": run.output}
 
-    run.estimated_tokens_used += estimate_tokens(str(plan))
-
-    if run.estimated_tokens_used > MAX_TOKENS_PER_RUN:
-        run.output = "Aborted: token budget exceeded during planning"
-        run.budget_exceeded = True
-        db.commit()
-        return {"error": "Token budget exceeded"}
+    # 🔎 DEBUG — PLANNER OUTPUT
+    print("DEBUG PLAN:", plan)
 
     db.add(
         AgentAction(
@@ -159,7 +129,7 @@ def run_agent(prompt: str, user, db):
     )
 
     # ------------------------------------------------
-    # 4.5 PERSIST PLANNER STEPS
+    # 4.5 STORE PLANNER STEPS
     # ------------------------------------------------
     planner_steps = []
 
@@ -189,16 +159,14 @@ def run_agent(prompt: str, user, db):
         is_tool_allowed(user, tool_name)
 
         if tool_name not in TOOLS:
-            step.status = "error"
             result = f"ERROR: Tool '{tool_name}' not registered"
             break
 
         tool_fn = TOOLS[tool_name]
 
-        # -------- ARG INJECTION (ENGINE AUTHORITY) --------
+        # -------- ARG INJECTION --------
         if tool_name == "retrieve_context":
-          # Planner explicitly requested RAG → allow
-          args = {"query": prompt, "user_id": user.id}
+            args = {"query": prompt, "user_id": user.id}
 
         elif tool_name == "generate_answer":
             args = {"question": prompt, "context": context}
@@ -213,7 +181,6 @@ def run_agent(prompt: str, user, db):
                 "title": raw_args.get("title"),
                 "description": raw_args.get("description"),
             }
-
         else:
             args = raw_args
 
@@ -221,36 +188,34 @@ def run_agent(prompt: str, user, db):
         try:
             with time_limit(10):
                 result = tool_fn(**args)
-            step.status = "executed"
         except ToolTimeout:
-            step.status = "error"
             result = f"ERROR: Tool '{tool_name}' timed out"
             break
         except Exception as e:
-            step.status = "error"
             result = f"ERROR: Tool '{tool_name}' failed: {str(e)}"
             break
+        if tool_name == "create_task":
+            run.output = str(result)
+            db.commit()
+            return {
+                "result": result,
+                "estimated_tokens_used": run.estimated_tokens_used,
+                "budget_exceeded": run.budget_exceeded,
+            }
 
-        # -------- TOKEN TRACKING (GENERATION ONLY) --------
-        if tool_name == "generate_answer":
-            run.estimated_tokens_used += estimate_tokens(str(result))
-
-            if run.estimated_tokens_used > MAX_TOKENS_PER_RUN:
-                run.output = "Aborted: token budget exceeded during generation"
-                run.budget_exceeded = True
-                db.commit()
-                return {"error": "Token budget exceeded"}
-
-        # -------- RAG EMPTY RESULT --------
+        # -------- RAG HANDLING --------
         if tool_name == "retrieve_context":
-            if not result:
-                run.output = "You don't have any document uploaded to answer this question."
-                run.budget_exceeded = False
+
+            #  No document exists
+            if result is None:
+                run.output = "No document is available to answer this question."
                 db.commit()
                 return {
-                    "error": run.output,
+                    "result": run.output,
                     "rag_used": True,
                 }
+
+            # ✅ Document exists ("" or text)
             context = result
 
         db.add(
@@ -259,31 +224,29 @@ def run_agent(prompt: str, user, db):
                 tool_name=tool_name,
                 tool_input=str(args),
                 tool_output=str(result),
-                status="success" if step.status == "executed" else "error",
-            )
-        )
-
-    # ------------------------------------------------
-    # 5.5 GUARANTEED FALLBACK
-    # ------------------------------------------------
-    if result is None:
-        tool_fn = TOOLS["generate_answer"]
-        result = tool_fn(question=prompt, context=None)
-
-        run.estimated_tokens_used += estimate_tokens(str(result))
-
-        db.add(
-            AgentAction(
-                run_id=run.id,
-                tool_name="generate_answer_fallback",
-                tool_input=prompt,
-                tool_output=str(result),
                 status="success",
             )
         )
 
     # ------------------------------------------------
-    # 6. FINALIZE RUN
+    # 5.5 GUARANTEED FALLBACK (ENGINE-CONTROLLED)
+    # ------------------------------------------------
+    if result is None:
+
+        # 🔒 Document questions NEVER fallback
+        if is_rag_allowed(prompt):
+            run.output = "The document does not contain information related to this question."
+            db.commit()
+            return {
+                "result": run.output,
+                "rag_used": True,
+            }
+
+        # ✅ Safe fallback for non-document questions
+        result = TOOLS["generate_answer"](question=prompt, context=None)
+
+    # ------------------------------------------------
+    # 6. FINALIZE
     # ------------------------------------------------
     run.output = str(result)
     db.commit()
